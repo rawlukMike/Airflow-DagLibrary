@@ -1,0 +1,149 @@
+from datetime import timedelta, datetime
+import fastavro
+import io
+from airflow import DAG
+from airflow.models.param import Param
+from airflow.decorators import task
+from airflow.providers.google.cloud.operators.gcs import GCSListObjectsOperator
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+
+# Extended GCSHook class with rename() and metadata()
+class MyGCSHook(GCSHook):
+  def get_metadata(
+    self,
+    bucket_name: str,
+    object_name: str,
+    ) -> dict:
+    client = self.get_conn()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.get_blob(blob_name=object_name)
+    return blob.metadata
+  
+  def set_metadata(
+    self,
+    bucket_name: str,
+    object_name: str,
+    metadata: dict
+    ):
+    client = self.get_conn()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.get_blob(blob_name=object_name)
+    blob.metadata = metadata
+    blob.patch()
+  
+  def rename(
+    self,
+    bucket_name: str,
+    old_name: str,
+    new_name: str
+    ):
+    client = self.get_conn()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.get_blob(old_name)
+    bucket.rename_blob(blob, new_name)
+
+default_args = {
+  'owner': 'airflow',
+  'depends_on_past': False,
+  'start_date': datetime(2024,5,10),
+  'email_on_failure': False,
+  'email_on_retry': False,
+  'retries': 0,
+  'bucket' : "rawcloud",
+  'dataset' : "Disney",
+  'project' : "my-project-1503596298622",
+  "google_cloud_storage_conn_id" : "google_cloud_default",
+  "gcp_conn_id" : "google_cloud_default",
+}
+
+with DAG(
+  'gcs-storage-organizer',
+  schedule_interval=timedelta(days=1),
+  render_template_as_native_obj=True,        
+  default_args=default_args,
+  params = {
+    "use_case": Param(default="gbr", type="string", enum=["gbr", "g2r", "ebs"])
+  }
+  ) as dag:
+
+  # Listing all Tables Files
+  GCS_Files = GCSListObjectsOperator(
+    task_id="List-AVRO-Files",
+    match_glob="bucket-name/disney/*/*/*.avro"
+  )
+
+  # Filter files to process
+  @task(task_id="Organize-Bucket-Folders")
+  def organise_blobs(**context):
+    files = context["ti"].xcom_pull(task_ids="List-AVRO-Files")
+    bucket = context["dag"].default_args["bucket"]
+    GCS_Hook = MyGCSHook()
+    table_types = set()
+    for blob in files:
+      if ".avro" in blob:
+        if "daily" in blob:
+          freq_type="daily"
+        else:
+          freq_type="weekly"
+        name_array = blob.split("/")
+        ingestion_date = name_array[3][0:4] + "-" + name_array[3][4:6] + "-" + name_array[3][6:8]
+        name_array[3] = f"ingestion_date={ingestion_date}"
+        table_type = name_array[-1].split(".")[-2].split("_")[0]
+        table_types.add(f"{freq_type}-{table_type}")
+        new_path = f"organised/{name_array[1]}/{name_array[2]}/{table_type}/{name_array[3]}/{name_array[-1]}"
+        GCS_Hook.rename(bucket, blob, new_path)
+    context["ti"].xcom_push(key="tables_names", value=table_types)
+
+
+  # Create New Tables list to create
+  @task(task_id="Refresh_External_Tables")
+  def Refresh_External_Tables(**context):
+    use_case = context["params"]["use_case"]
+    dataset = context["dag"].default_args["dataset"]
+    bucket = context["dag"].default_args["bucket"]
+    project = context["dag"].default_args["project"]
+    tables = context["ti"].xcom_pull(task_ids="Organize-Bucket-Folders", key="tables_names")
+    bq_hook =BigQueryHook()
+    current_tables = bq_hook.get_dataset_tables_list(dataset)
+    print(current_tables)
+    for table in tables:
+      if table not in current_tables:
+        table_type = table.split("-")[-1]
+        table_name = f"{table}"
+        if "daily" in table:
+          freq_type = "daily"
+        else:
+          freq_type = "weekly"
+        uri = f"gs://{bucket}/organised/{use_case}/{freq_type}/{table_type}/*.avro"
+      print(f"CREATING: {table_name}, uri:{uri}")
+      ExternalDataConfiguration = {
+        "source_uris": [uri],
+        "source_format": "AVRO",
+        "autodetect": True,
+        "hive_partitioning_options": {
+          "mode": "AUTO",
+          "source_uri_prefix": f"gs://rawcloud/organised/{use_case}/{freq_type}/{table_type}",
+          "require_partition_filter": False
+        }
+      }
+      Table = {
+        "table_reference": {
+          "project_id": project,
+          "dataset_id": dataset,
+          "table_id": table_name
+        },
+        "type": "EXTERNAL",
+        "external_data_configuration" : ExternalDataConfiguration
+      }
+      bq_hook.create_empty_table(
+        dataset_id=dataset,
+        project_id=project,
+        table_id=table_name,
+        table_resource=Table
+      )
+
+  GCS_Files>>organise_blobs()>>Refresh_External_Tables()
+
+if __name__ == "__main__":
+  dag.test()
